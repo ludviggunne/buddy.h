@@ -51,13 +51,6 @@ void buddy_free(buddy_t *buddy, void *ptr);
 
 
 
-#include <stdint.h>
-#ifdef BUDDY_DEBUG
-#include <stdio.h>
-#endif
-
-
-
 /* the offset of the usable memory region in a block */
 #define BLOCK_MEM_OFFSET (size_t)(&((struct block *)0)->mem)
 
