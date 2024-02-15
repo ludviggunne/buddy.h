@@ -1,284 +1,425 @@
 
+/**
+ *  Buddy allocator. Do not use in conjunction with
+ *  malloc / free.
+ *
+ *  Usage:
+ *
+ *      #define BUDDY_IMPLEMENTATION
+ *      #include "buddy.h"
+ *
+ *      int main()
+ *      {
+ *          char *ptr = balloc(sizeof(*ptr));
+ *          *ptr = 'X';
+ *          bfree(ptr);
+ *      }
+ */
+
 #ifndef BUDDY_H
 #define BUDDY_H
 
-/**
- * Usage:
- *     #define BUDDY_IMPLEMENTATION
- *     #include "buddy.h"
- */
+#ifdef BUDDY_STDLIB_OVERRIDE
+    #include <stdlib.h>
+    #define BNULL    NULL
+    #define balloc   malloc
+    #define bfree    free
+    #define brealloc realloc
+    #define bcalloc  calloc
+#else
+    #define BNULL ((void *) 0)
+#endif
 
 #include <stddef.h>
 
-typedef struct block block_t;
-
-typedef struct {
-    block_t *start;
-    block_t *stop;
-} buddy_t;
-
-
 
 /**
- * Initialize allocator with pre-allocated memory.
- * The size should optimally be equal to a power of two.
+ *  Allocate `size` bytes of memory.
+ *  Returns BNULL on failure.
  */
-buddy_t buddy_init(void *mem, size_t size);
+void *balloc(size_t size);
 
 /**
- * Allocate a new block of memory.
- * Returns NULL on fail
+ *  Free previously allocated memory.
  */
-void *buddy_alloc(buddy_t *buddy, size_t size);
+void bfree(void *ptr);
 
 /**
- * Free previously allocated memory.
+ *  Attempt to reallocate memory to fit new size.
+ *  Returns BNULL on failure.
  */
-void buddy_free(buddy_t *buddy, void *ptr);
+void *brealloc(void *ptr, size_t size);
 
+/**
+ *  Allocate memory for `nitems` objects of size `size`,
+ *  and zero memory. Returns BNULL on failure.
+ */
+void *bcalloc(size_t nitems, size_t size);
 
-
-#endif /* BUDDY_H */
-
-
-
-
+#endif
 
 
 
 #ifdef BUDDY_IMPLEMENTATION
 #undef BUDDY_IMPLEMENTATION
 
+#include <stdint.h>
+#include <unistd.h>
+#include <assert.h>
+#include <string.h>
+#include <pthread.h>
 
-
-/* the offset of the usable memory region in a block */
-#define BLOCK_MEM_OFFSET (size_t)(&((struct block *)0)->mem)
-
-/* get a pointer to the block containing usable memory pointed to by ptr */
-#define MEM_BLOCK_PTR(ptr) (struct block *)((byte_t *)ptr - BLOCK_MEM_OFFSET)
-
-/* size of usable memory in a block with given size */
-#define MEM_SIZE(size) (size - BLOCK_MEM_OFFSET)
-
-/* size of block containing usable memory of given size */
-#define BLOCK_SIZE(size) (size + BLOCK_MEM_OFFSET)
-
-/* the smallest size for a single block */
-#define BLOCK_MIN_SIZE (BLOCK_MEM_OFFSET + sizeof(word_t))
-
-/* offset a block pointer by given number of bytes */
-#define BLOCK_BYTE_OFFSET(block, offset) ((block_t *)((byte_t *)(block) + (offset)))
-
-
-
-typedef intptr_t word_t;
 typedef uint8_t byte_t;
 
-
-
-struct block
-{
-    /* HEADER */
+struct block {
     size_t size;
-    byte_t free;
-    /* MEMORY */
-    word_t mem[];
+    int used;
+    _Alignas(max_align_t) byte_t mem[];
 };
 
+#ifndef BUDDY_BLOCK_INIT_SIZE
+#define BUDDY_BLOCK_INIT_SIZE 4096
+#endif
 
-
-/* FORWARD DECLARATIONS */
-
-static block_t *get_next(block_t *block, block_t *stop);
-static block_t *split(block_t *block);
-static size_t p2align_down(size_t size);
-static block_t *try_merge(block_t *start, block_t *block, block_t *stop);
+_Static_assert((BUDDY_BLOCK_INIT_SIZE & (BUDDY_BLOCK_INIT_SIZE - 1)) == 0,
+               "buddy.h: BUDDY_BLOCK_INIT_SIZE must be a power of two.");
 
 
 
-/* API */
+// find next block
+#define NEXT(block_ptr)\
+    (struct block *)((byte_t*)(block_ptr) + (block_ptr)->size)
+// the offset of the usable memory region in a block
+#define MEMOFFSET (offsetof(struct block, mem))
+// the size of usable memory `block_ptr` can hold
+#define MEMSIZE(block_ptr) (size_t)((block_ptr)->size - MEMOFFSET)
+// get pointer to block containing `mem`
+#define BLOCK(mem) (struct block *)((byte_t *)mem - MEMOFFSET)
+// the size of usable memory if we would split `block_ptr`
+#define HALFMEMSIZE(block_ptr)\
+    (size_t)((block_ptr)->size / 2 - MEMOFFSET)
+// the smallest size a block can be
+#define MINBLOCKSIZE 16
+// the size of a block that can hold `memsize` bytes
+// of usable memory
+#define BLOCKSIZE(memsize) (memsize + MEMOFFSET)
+// the byte offset between two pointers
+#define BYTEDIFF(ptr1, ptr2)\
+    (size_t) ((byte_t *) ptr2 - (byte_t *) ptr1)
 
-buddy_t buddy_init(void *mem, size_t size)
+
+// points to the first block in memory
+static struct block *start;
+// points to the end of last block in memory
+static struct block *end;
+// points to the next block to consider for allocation
+static struct block *next;
+// lock for the whole allocator
+static pthread_mutex_t lock;
+
+
+#ifdef BUDDY_STDLIB_OVERRIDE
+// we call bfree (=free when this ^^^ is defined)
+// and then use the pointer in some functions
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuse-after-free"
+#endif
+
+__attribute__((constructor))
+static void init(void)
 {
-    size = p2align_down(size);
+    pthread_mutexattr_t lock_attr;
+    // lock may be aquired multiple times,
+    // for example when brealloc calls balloc
+    pthread_mutexattr_settype(&lock_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&lock, &lock_attr);
+    pthread_mutex_lock(&lock);
 
-    block_t *block = mem;
-    block->size = size;
-    block->free = 1;
+    // setup an inital block of size BUDDY_BLOCK_INIT_SIZE
+    start = sbrk(0);
 
-    buddy_t buddy;
-    buddy.start = block;
-    buddy.stop = BLOCK_BYTE_OFFSET(block, size);
-
-    return buddy;
-}
-
-
-
-void *buddy_alloc(buddy_t *buddy, size_t size)
-{
-    if (size == 0)
+    // adjust alignment if necessary
+    const size_t A = _Alignof(max_align_t);
+    if ((size_t) start % A > 0)
     {
-        return NULL;
+        (void) sbrk(A - (size_t) start % A);
+        start = sbrk(0);
     }
 
-    block_t *block = buddy->start;
-
-    /* find free block */
-    while (!block->free || MEM_SIZE(block->size) < size)
+    if (sbrk(BUDDY_BLOCK_INIT_SIZE) == (void *) -1)
     {
-        block = get_next(block, buddy->stop);
-        if (block == NULL)
+        assert(0 && "failed to initialize buddy.h");
+    }
+    end = (struct block *)
+        ((byte_t *) start + BUDDY_BLOCK_INIT_SIZE);
+
+    next = start;
+    next->size = BUDDY_BLOCK_INIT_SIZE;
+    next->used = 0;
+    pthread_mutex_unlock(&lock);
+}
+
+static struct block *grow(size_t required)
+{
+    required = BLOCKSIZE(required);
+    size_t current_size;
+    struct block *block;
+
+    // if there is just one free block,
+    // just grow that
+    if (NEXT(start) == end && !start->used)
+    {
+        size_t size = start->size;
+        while (size < required)
         {
-            return NULL;
+            size *= 2;
         }
-    }
 
-    /* find smallest block that will fit allocation */
-    while (MEM_SIZE(block->size / 2) >= size)
-    {
-        block_t *new_block = split(block);
-        if (new_block == NULL)
+        if (sbrk(size - start->size) == (void *) -1)
         {
-            break;
+            return BNULL;
         }
-        block = new_block;
+
+        start->size = size;
+        end = NEXT(start);
+
+        return start;
     }
 
-    block->free = 0;
-    return &block->mem;
-}
+    // keep growing until last block is big enough
+    do {
+        current_size = BYTEDIFF(start, end);
 
+        if (sbrk(current_size) == (void *) -1)
+        {
+            return BNULL;
+        }
 
+        block = end;
+        block->size = current_size;
+        block->used = 0;
 
-void buddy_free(buddy_t *buddy, void *ptr)
-{
-    block_t *block = MEM_BLOCK_PTR(ptr);
-    while ((block = try_merge(buddy->start, block, buddy->stop)));
-}
+        end = NEXT(block);
 
-
-
-/* INTERNALS */
-
-/* determines if the block is left or right buddy */
-/* from its size and offset from start block */
-static int is_left(block_t *start, block_t *block)
-{
-    size_t offset = (byte_t *)block - (byte_t *)start;
-    return offset % (block->size * 2) == 0;
-}
-
-
-
-/* returns the block resulting from merge */
-/* returns NULL if merge is not possible */
-static block_t *try_merge(block_t *start, block_t *block, block_t *stop)
-{
-
-    block_t *buddy;
-
-    const int left = is_left(start, block);
-
-    if (left)
-    {
-        buddy = BLOCK_BYTE_OFFSET(block, block->size);
-    }
-    else
-    {
-        buddy = BLOCK_BYTE_OFFSET(block, -block->size);
-    }
-
-    const int no_merge =
-        /* can't merge root block */
-        buddy >= stop ||
-        /* can't merge with used block */
-        !buddy->free ||
-        /* can't merge with block of different size */
-        buddy->size != block->size;
-
-    if (no_merge)
-    {
-        return NULL;
-    }
-
-    block_t *new_block;
-
-    if (left)
-    {
-        new_block = block;
-    }
-    else
-    {
-        new_block = buddy;
-    }
-
-    new_block->size = block->size * 2;
-    new_block->free = 1;
-
-    return new_block;
-}
-
-
-
-static block_t *split(block_t *block)
-{
-    if (block->size / 2 < BLOCK_MIN_SIZE)
-    {
-        return NULL;
-    }
-
-    block->size /= 2;
-
-    /* split block can't be root -> don't check for overflow */
-    block_t *buddy = get_next(block, NULL);
-
-    buddy->size = block->size;
-    buddy->free = 1;
+    } while (current_size < required);
 
     return block;
 }
 
-
-
-/* get the next block in the structure */
-/* doesn't check for overflow if stop is NULL */
-static block_t *get_next(block_t *block, block_t *stop)
+static void split(struct block *block)
 {
-    block_t *next_block = BLOCK_BYTE_OFFSET(block, block->size);
+    block->size /= 2;
+    struct block *next = NEXT(block);
+    next->size = block->size;
+    next->used = 0;
+}
 
-    if (stop != NULL && next_block >= stop)
+static struct block *join(struct block *block)
+{
+    struct block *buddy, *joined;
+    size_t size = block->size;
+
+    for (;;)
     {
-        return NULL;
+        if (BYTEDIFF(start, block) % (size * 2) == 0)
+        {
+            buddy = (struct block *) ((byte_t *) block + size);
+            joined = block;
+        }
+        else
+        {
+            buddy = (struct block *) ((byte_t *) block - size);
+            joined = buddy;
+        }
+
+        if (buddy == end ||
+            buddy->size != size ||
+            buddy->used)
+        {
+            break;
+        }
+        else
+        {
+            block = joined;
+            size *= 2;
+        }
     }
 
-    return next_block;
+    block->size = size;
+    block->used = 0;
+    return block;
 }
 
-
-
-/* find the biggest power of 2 that fits in size */
-static size_t p2align_down(size_t size)
+void *balloc(size_t size)
 {
-    size--;
-    size |= size >> 1;
-    size |= size >> 2;
-    size |= size >> 4;
-    size |= size >> 8;
-    size |= size >> 16;
-    size |= size >> 32;
-    size++;
-    size >>= 1;
-    return size;
+    pthread_mutex_lock(&lock);
+
+    struct block *block = next;
+
+    // search for unused block that fits allocation
+    while (MEMSIZE(block) < size || block->used)
+    {
+
+        block = NEXT(block);
+
+        // wrap around
+        if (block == end)
+        {
+            block = start;
+        }
+
+        // went through all available blocks
+        // try to grow
+        if (block == next)
+        {
+            block = grow(size);
+            if (block == BNULL)
+            {
+                // can't grow
+                pthread_mutex_unlock(&lock);
+                return BNULL;
+            }
+            break;
+        }
+    }
+
+    // split until we have best fit
+    while (HALFMEMSIZE(block) >= size && block->size > MINBLOCKSIZE)
+    {
+        split(block);
+    }
+
+    // record where we should start searching next
+    next = NEXT(block);
+    if (next == end)
+    {
+        next = start;
+    }
+
+    block->used = 1;
+    pthread_mutex_unlock(&lock);
+    return block->mem;
 }
 
+void bfree(void *ptr)
+{
+    if (ptr == BNULL)
+    {
+        return;
+    }
 
+    pthread_mutex_lock(&lock);
+    struct block *block = BLOCK(ptr);
+    block = join(block);
+    next = block;
+    pthread_mutex_unlock(&lock);
+}
 
-#undef BLOCK_MEM_OFFSET
-#undef MEM_BLOCK_PTR
-#undef MEM_SIZE
-#undef BLOCK_SIZE
-#undef BLOCK_MIN_SIZE
-#undef BLOCK_BYTE_OFFSET
+void *brealloc(void *ptr, size_t size)
+{
+    pthread_mutex_lock(&lock);
+    struct block *block, *buddy;
+    size_t block_size;
+    byte_t *new_ptr;
 
-#endif /* BUDDY_IMPLEMENTATION */
+    if (ptr == BNULL)
+    {
+        return balloc(size);
+    }
+
+    if (size == 0)
+    {
+        bfree(ptr);
+        pthread_mutex_unlock(&lock);
+        return BNULL;
+    }
+
+    block = BLOCK(ptr);
+
+    if (MEMSIZE(block) >= size)
+    {
+        while ((block->size / 2 - MEMOFFSET) >= size)
+        {
+            split(block);
+        }
+        next = NEXT(block);
+        pthread_mutex_unlock(&lock);
+        return block->mem;
+    }
+
+    block_size = block->size;
+
+    // try to grow current block by joining
+    // with only right buddies
+    for (;;)
+    {
+        if (block_size >= BLOCKSIZE(size))
+        {
+            block->size = block_size;
+            next = NEXT(block);
+            pthread_mutex_unlock(&lock);
+            return block->mem;
+        }
+
+        buddy = (struct block *) ((byte_t *) block + block_size);
+
+        if (BYTEDIFF(start, block) % (block_size * 2) > 0 ||
+            buddy == end ||
+            buddy->size != block_size ||
+            buddy->used)
+        {
+            break;
+        }
+
+        block_size *= 2;
+    }
+
+    block_size = block->size;
+    bfree(ptr);
+
+    new_ptr = balloc(size);
+    if (new_ptr == BNULL)
+    {
+        // restore freed block
+        block->size = block_size;
+        block->used = 1;
+        pthread_mutex_unlock(&lock);
+        return BNULL;
+    }
+
+    if (new_ptr < (byte_t *)ptr)
+    {
+        for (size_t i = 0; i < MEMSIZE(block); i++)
+        {
+            new_ptr[i] = ((byte_t *)ptr)[i];
+        }
+    }
+    else
+    {
+        for (size_t i = MEMSIZE(block); i > 0; i--)
+        {
+            new_ptr[i - 1] = ((byte_t *)ptr)[i - 1];
+        }
+    }
+
+    pthread_mutex_unlock(&lock);
+    return new_ptr;
+}
+
+void *bcalloc(size_t nitems, size_t size)
+{
+    size *= nitems;
+    char *ptr = balloc(size);
+    if (ptr == BNULL)
+    {
+        return BNULL;
+    }
+    memset(ptr, 0, size);
+    return ptr;
+}
+
+#ifdef BUDDY_STDLIB_OVERRIDE
+#pragma GCC diagnostic pop
+#endif
+
+#endif
