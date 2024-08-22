@@ -1,4 +1,3 @@
-
 /**
  *  Buddy allocator. Do not use in conjunction with
  *  malloc / free.
@@ -14,6 +13,11 @@
  *          *ptr = 'X';
  *          bfree(ptr);
  *      }
+ *  buddy.h can also replace the default malloc implementation.
+ *  Example:
+ *      $ make
+ *      $ LD_PRELOAD=./libbuddy.so vim
+ *
  */
 
 #ifndef BUDDY_H

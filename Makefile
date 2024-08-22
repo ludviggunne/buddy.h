@@ -1,5 +1,5 @@
 
-libbuddy.so: ../buddy.h buddy.c
+libbuddy.so: buddy.h buddy.c
 	gcc -fPIC \
 		-Wall -Wextra -Wpedantic \
 		-DBUDDY_STDLIB_OVERRIDE \

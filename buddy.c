@@ -1,3 +1,2 @@
-
 #define BUDDY_IMPLEMENTATION
-#include "../buddy.h"
+#include "buddy.h"
